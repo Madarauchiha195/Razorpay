@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity, ArrowRight, BadgeCheck, BarChart3, Bot, BrainCircuit, Check,
   ChevronRight, CircleDollarSign, Clock3, Copy, CreditCard, Flame, Gauge,
   Gem, LockKeyhole, Menu, MessageSquareText, PackageCheck, Play, Plus,
-  RefreshCcw, RotateCcw, Settings2, ShieldAlert, ShieldCheck, ShieldX,
-  Sparkles, TrendingUp, WalletCards, X,
+  RefreshCcw, RotateCcw, Send, Settings2, ShieldAlert, ShieldCheck, ShieldX,
+  Sparkles, TrendingUp, User, WalletCards, X,
 } from "lucide-react";
 import { Area, AreaChart, Bar, BarChart, Cell, Pie, PieChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
 
@@ -24,6 +24,8 @@ type Product = { product_id: string; product_name: string; listing_price: number
 type ActivityDay = { day: string; date: string; negotiations: number; authorized: number; blocked: number; revenue: number; concession: number; value: number };
 type BlockReason = { code: string; name: string; count: number; percent: number };
 type AgentState = { agent_frozen: boolean; violation_count: number; daily_concession_cost: number; transactions_today: number };
+type ChatTurn = { role: "buyer" | "agent"; text: string; price?: number; code?: string; tone?: "approved" | "blocked"; at: string };
+type ChatResponse = { session_id: string; turn: number; status: string; reply: string; code: string | null; offer: Offer | null; deal: Deal | null; price: number | null; engine: string | null; live_llm: boolean; message?: string };
 
 const REASON_COLORS = ["#ff5d72", "#ffb45a", "#8c78ff", "#6879a6", "#4fd1a5", "#f472b6"];
 
@@ -91,6 +93,9 @@ export default function App() {
   const [paymentMessage, setPaymentMessage] = useState("");
   const [notice, setNotice] = useState("");
   const [mobileMenu, setMobileMenu] = useState(false);
+  const [sessionId, setSessionId] = useState("");
+  const [chat, setChat] = useState<ChatTurn[]>([]);
+  const [chatBusy, setChatBusy] = useState(false);
 
   // Every figure below comes from the API. Nothing is padded with placeholder numbers.
   const refresh = async (id = productId) => {
@@ -132,14 +137,27 @@ export default function App() {
     return { cost, value };
   }, [policy.concessions, selectedBenefits]);
 
+  const pushChat = (turn: Omit<ChatTurn, "at">) =>
+    setChat((existing) => [...existing, { ...turn, at: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) }]);
+
   const addEvent = (event: StreamEvent) => {
     setStream((existing) => [...existing, event]);
+    if (event.session_id) setSessionId(event.session_id);
     if (event.offer) setLastOffer(event.offer);
     if (event.deal) setDeal(event.deal);
+    // The conversation view is a buyer-readable projection of the same guarded events, not a second
+    // transcript: nothing appears here that DealGuard has not already ruled on.
+    if (event.type === "OFFER_PROPOSED" && event.offer) pushChat({ role: "agent", text: event.offer.justification, price: event.offer.offered_price });
+    else if (event.type === "DEAL_AUTHORIZED" && event.deal) pushChat({ role: "agent", text: "Signed and locked in. This authorization is time-limited and ready for payment.", price: event.deal.final_price, tone: "approved" });
+    else if (event.type === "DEALGUARD_BLOCK") pushChat({ role: "agent", text: event.message ?? "DealGuard blocked that proposal.", code: event.code, tone: "blocked" });
+    else if (event.type === "HUMAN_REVIEW_REQUIRED") pushChat({ role: "agent", text: event.message ?? "This offer needs merchant approval before payment.", tone: "blocked" });
+    else if (event.type === "NEGOTIATION_FAILED") pushChat({ role: "agent", text: event.message ?? "The negotiation ended without an authorization.", code: event.code, tone: "blocked" });
   };
 
   const negotiate = async () => {
     setIsNegotiating(true); setStream([]); setLastOffer(null); setDeal(null); setPaymentMessage(""); setTab("negotiate");
+    setSessionId(""); setChat([]);
+    pushChat({ role: "buyer", text: message });
     try {
       const response = await fetch(`${API_URL}/api/negotiation/start`, {
         method: "POST", headers: { "Content-Type": "application/json" },
@@ -163,8 +181,34 @@ export default function App() {
     } finally { setIsNegotiating(false); }
   };
 
-  const setPolicyValue = (key: keyof Policy, value: number | boolean) => setPolicy((previous) => ({ ...previous, [key]: value } as Policy));
-  const savePolicy = async () => {
+  // The message box is the buyer's live line to their agent: the first send opens a negotiation with
+  // it, every later send is one more guarded round on the same session. The price the reply carries
+  // has already been through DealGuard, so the chat can move the price without moving the boundary.
+  const sendChat = async () => {
+    const text = message.trim();
+    if (!text || chatBusy || isNegotiating) return;
+    if (!sessionId) { await negotiate(); return; }
+    setChatBusy(true); pushChat({ role: "buyer", text }); setMessage("");
+    try {
+      const response = await fetch(`${API_URL}/api/negotiation/${sessionId}/message`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message: text }),
+      });
+      const turn = await response.json() as ChatResponse;
+      if (!response.ok) throw new Error(turn.message ?? "The negotiation service rejected this turn.");
+      const settled = turn.status === "BLOCKED" || turn.status === "CLOSED" || turn.status === "LIMIT_REACHED" || turn.status === "FAILED";
+      pushChat({ role: "agent", text: turn.reply, price: turn.price ?? undefined, code: turn.code ?? undefined, tone: turn.status === "AUTHORIZED" ? "approved" : settled ? "blocked" : undefined });
+      if (turn.offer) setLastOffer(turn.offer);
+      if (turn.deal) setDeal(turn.deal);
+      // Also recorded in the decision stream, so the audit view stays the complete picture. Appended
+      // directly rather than through addEvent, which would duplicate the chat bubble above.
+      setStream((existing) => [...existing, { type: `CHAT_${turn.status}`, message: turn.reply, round: turn.turn, code: turn.code ?? undefined, offer: turn.offer ?? undefined, deal: turn.deal ?? undefined }]);
+      await refresh();
+    } catch {
+      pushChat({ role: "agent", text: "Your agent could not reach the negotiation service. Check that the FastAPI server is running.", tone: "blocked" });
+    } finally { setChatBusy(false); }
+  };
+
+  const setPolicyValue = (key: keyof Policy, value: number | boolean) => setPolicy((previous) => ({ ...previous, [key]: value } as Policy));  const savePolicy = async () => {
     try {
       const response = await fetch(`${API_URL}/api/merchant/policy`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(policy) });
       if (!response.ok) throw new Error("save failed");
@@ -217,7 +261,7 @@ export default function App() {
       <header className="topbar"><button className="mobile-menu" onClick={() => setMobileMenu(true)}><Menu size={21} /></button><div><p className="eyebrow">AGENTIC COMMERCE PROTOCOL</p><h1>{tab === "overview" ? "Command center" : tab === "negotiate" ? "Buyer negotiation studio" : tab === "merchant" ? "Merchant intelligence" : "DealGuard control room"}</h1></div><div className="topbar-actions"><StatusPill tone="green">Test environment</StatusPill><button className="icon-button" title="Refresh data" onClick={() => void refresh()}><RefreshCcw size={17} /></button><button className="primary-button compact" onClick={negotiate}><Play size={15} />Try negotiation</button></div></header>
       {notice && <div className="notice"><Activity size={16} />{notice}<button onClick={() => setNotice("")}><X size={15} /></button></div>}
       {tab === "overview" && <Overview dashboard={dashboard} policy={policy} activity={activity} onStart={negotiate} onTab={setTab} />}
-      {tab === "negotiate" && <NegotiationStudio policy={policy} products={products} productId={productId} onProduct={selectProduct} budget={budget} setBudget={setBudget} selectedBenefits={selectedBenefits} setSelectedBenefits={setSelectedBenefits} message={message} setMessage={setMessage} economics={economics} stream={stream} offer={lastOffer} deal={deal} negotiating={isNegotiating} onStart={negotiate} onPayment={payment} paymentMessage={paymentMessage} />}
+      {tab === "negotiate" && <NegotiationStudio policy={policy} products={products} productId={productId} onProduct={selectProduct} budget={budget} setBudget={setBudget} selectedBenefits={selectedBenefits} setSelectedBenefits={setSelectedBenefits} message={message} setMessage={setMessage} economics={economics} stream={stream} offer={lastOffer} deal={deal} negotiating={isNegotiating} onStart={negotiate} onPayment={payment} paymentMessage={paymentMessage} chat={chat} chatBusy={chatBusy} sessionId={sessionId} onSend={sendChat} />}
       {tab === "merchant" && <MerchantOps dashboard={dashboard} policy={policy} events={events} activity={activity} reasons={reasons} />}
       {tab === "guard" && <GuardRoom policy={policy} events={events} frozen={agentFrozen} onNumber={setPolicyValue} onSave={savePolicy} onFreeze={toggleFreeze} />}
     </main>
@@ -235,17 +279,39 @@ function Overview({ dashboard, policy, activity, onStart, onTab }: { dashboard: 
 
 function FlowRow({ icon: Icon, title, text, active = false }: { icon: typeof Bot; title: string; text: string; active?: boolean }) { return <div className={`flow-row ${active ? "active" : ""}`}><div className="flow-icon"><Icon size={17} /></div><div><strong>{title}</strong><span>{text}</span></div>{active ? <StatusPill tone="green">Verified</StatusPill> : <ChevronRight size={16} />}</div>; }
 
-function NegotiationStudio({ policy, products, productId, onProduct, budget, setBudget, selectedBenefits, setSelectedBenefits, message, setMessage, economics, stream, offer, deal, negotiating, onStart, onPayment, paymentMessage }: { policy: Policy; products: Product[]; productId: string; onProduct: (id: string) => void; budget: number; setBudget: (value: number) => void; selectedBenefits: string[]; setSelectedBenefits: (value: string[]) => void; message: string; setMessage: (value: string) => void; economics: { cost: number; value: number }; stream: StreamEvent[]; offer: Offer | null; deal: Deal | null; negotiating: boolean; onStart: () => void; onPayment: () => void; paymentMessage: string }) {
+function NegotiationStudio({ policy, products, productId, onProduct, budget, setBudget, selectedBenefits, setSelectedBenefits, message, setMessage, economics, stream, offer, deal, negotiating, onStart, onPayment, paymentMessage, chat, chatBusy, sessionId, onSend }: { policy: Policy; products: Product[]; productId: string; onProduct: (id: string) => void; budget: number; setBudget: (value: number) => void; selectedBenefits: string[]; setSelectedBenefits: (value: string[]) => void; message: string; setMessage: (value: string) => void; economics: { cost: number; value: number }; stream: StreamEvent[]; offer: Offer | null; deal: Deal | null; negotiating: boolean; onStart: () => void; onPayment: () => void; paymentMessage: string; chat: ChatTurn[]; chatBusy: boolean; sessionId: string; onSend: () => void }) {
   const toggleBenefit = (id: string) => setSelectedBenefits(selectedBenefits.includes(id) ? selectedBenefits.filter((item) => item !== id) : [...selectedBenefits, id]);
   // Budget bounds follow the selected product so the slider stays meaningful at every price point.
   const step = policy.target_price >= 100000 ? 500 : 100;
   const sliderMax = policy.target_price;
   const sliderMin = Math.floor((policy.target_price * 0.85) / step) * step;
   const maxPackageValue = policy.concessions.reduce((sum, item) => sum + item.customer_perceived_value, 0) || 1;
-  return <div className="page-stack negotiation-page"><section className="studio-grid"><article className="panel buyer-input"><div className="panel-heading"><div><p className="eyebrow">BUYER AGENT</p><h3>Shape the ask</h3></div><div className="agent-presence buyer-presence"><Bot size={17} />Online</div></div><div className="product-mini"><div className="product-visual"><Gem size={27} /></div><div><span>NEGOTIATING FOR</span>{products.length > 0 ? <select className="product-select" value={productId} onChange={(event) => onProduct(event.target.value)} disabled={negotiating} aria-label="Choose a product to negotiate">{products.map((item) => <option key={item.product_id} value={item.product_id}>{item.product_name}</option>)}</select> : <strong>{policy.product_name}</strong>}<small>List price {currency(policy.target_price)}</small></div>{policy.flagship_product ? <StatusPill tone="blue">Flagship</StatusPill> : <StatusPill tone="slate">Standard</StatusPill>}</div><label className="field-label">Maximum budget <strong>{currency(budget)}</strong></label><input className="budget-range" type="range" min={sliderMin} max={sliderMax} step={step} value={budget} onChange={(event) => setBudget(Number(event.target.value))} /><div className="range-labels"><span>{compactCurrency(sliderMin)}</span><span>{compactCurrency(sliderMax)}</span></div><label className="field-label margin-top">Value preferences</label><div className="benefit-options">{policy.concessions.map((item) => <button key={item.id} className={`benefit-option ${selectedBenefits.includes(item.id) ? "selected" : ""}`} onClick={() => toggleBenefit(item.id)}><span className="check-circle">{selectedBenefits.includes(item.id) && <Check size={13} />}</span><span>{item.name}</span><small>+{currency(item.customer_perceived_value)} value</small></button>)}</div><label className="field-label margin-top">Message to your buyer agent</label><textarea value={message} onChange={(event) => setMessage(event.target.value)} maxLength={500} /><button className="primary-button start-button" onClick={onStart} disabled={negotiating}>{negotiating ? <><RefreshCcw className="spin" size={17} />Negotiating safely…</> : <><Sparkles size={17} />Start agent negotiation</>}</button><p className="input-footnote"><LockKeyhole size={13} />The buyer agent never sees merchant floor, margin, or policy data.</p></article>
+  return <div className="page-stack negotiation-page"><section className="studio-grid"><article className="panel buyer-input"><div className="panel-heading"><div><p className="eyebrow">BUYER AGENT</p><h3>Shape the ask</h3></div><div className="agent-presence buyer-presence"><Bot size={17} />Online</div></div><div className="product-mini"><div className="product-visual"><Gem size={27} /></div><div><span>NEGOTIATING FOR</span>{products.length > 0 ? <select className="product-select" value={productId} onChange={(event) => onProduct(event.target.value)} disabled={negotiating} aria-label="Choose a product to negotiate">{products.map((item) => <option key={item.product_id} value={item.product_id}>{item.product_name}</option>)}</select> : <strong>{policy.product_name}</strong>}<small>List price {currency(policy.target_price)}</small></div>{policy.flagship_product ? <StatusPill tone="blue">Flagship</StatusPill> : <StatusPill tone="slate">Standard</StatusPill>}</div><label className="field-label">Maximum budget <strong>{currency(budget)}</strong></label><input className="budget-range" type="range" min={sliderMin} max={sliderMax} step={step} value={budget} onChange={(event) => setBudget(Number(event.target.value))} /><div className="range-labels"><span>{compactCurrency(sliderMin)}</span><span>{compactCurrency(sliderMax)}</span></div><label className="field-label margin-top">Value preferences</label><div className="benefit-options">{policy.concessions.map((item) => <button key={item.id} className={`benefit-option ${selectedBenefits.includes(item.id) ? "selected" : ""}`} onClick={() => toggleBenefit(item.id)}><span className="check-circle">{selectedBenefits.includes(item.id) && <Check size={13} />}</span><span>{item.name}</span><small>+{currency(item.customer_perceived_value)} value</small></button>)}</div><label className="field-label margin-top">Message to your buyer agent</label><textarea value={message} onChange={(event) => setMessage(event.target.value)} maxLength={500} onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); onSend(); } }} /><button className="ghost-button chat-send" onClick={onSend} disabled={negotiating || chatBusy || message.trim().length === 0}>{chatBusy ? <><RefreshCcw className="spin" size={15} />Agent is replying…</> : <><Send size={15} />{sessionId ? "Send to agent" : "Send & open negotiation"}</>}</button><button className="primary-button start-button" onClick={onStart} disabled={negotiating}>{negotiating ? <><RefreshCcw className="spin" size={17} />Negotiating safely…</> : <><Sparkles size={17} />Start agent negotiation</>}</button><p className="input-footnote"><LockKeyhole size={13} />The buyer agent never sees merchant floor, margin, or policy data.</p></article>
     <article className="panel live-feed"><div className="panel-heading"><div><p className="eyebrow">LIVE NEGOTIATION</p><h3>Agent decision stream</h3></div>{negotiating ? <StatusPill tone="blue">Streaming</StatusPill> : <StatusPill tone="slate">Awaiting intent</StatusPill>}</div><div className="feed-scroll">{stream.length === 0 && <div className="empty-feed"><div className="empty-orb"><MessageSquareText size={24} /></div><h4>A smarter deal starts here</h4><p>Submit your budget and priorities. Each proposal will be visible, validated, and auditable in real time.</p></div>}{stream.map((event, index) => <div className={`stream-row ${event.type.includes("BLOCK") || event.type.includes("FAILED") ? "blocked" : event.type.includes("AUTHORIZED") ? "approved" : ""}`} key={`${event.type}-${index}`}><div className="stream-icon"><TimelineIcon event={event} /></div><div className="stream-content"><div className="stream-meta"><strong>{humanType(event.type)}</strong>{event.round && <span>ROUND {event.round}</span>}</div><p>{event.message ?? event.code ?? "Event recorded"}</p>{event.offer && <OfferPreview offer={event.offer} />}{event.code && event.type.includes("BLOCK") && <span className="code-badge"><ShieldX size={12} />{event.code}</span>}</div></div>)}</div>{offer && !deal && <OfferPreview offer={offer} large />}</article>
     <aside className="studio-side"><article className="panel value-calculator"><div className="panel-heading"><div><p className="eyebrow">VALUE SIGNAL</p><h3>Package economics</h3></div><TrendingUp size={19} className="mint-icon" /></div><div className="value-number"><strong>{currency(offer?.estimated_customer_value ?? economics.value)}</strong><span>estimated customer value</span></div><div className="ratio-line"><span>Customer benefit mix</span><strong>{selectedBenefits.length || 0} items</strong></div><div className="ratio-bar"><span style={{ width: `${Math.min(100, ((offer?.estimated_customer_value ?? economics.value) / maxPackageValue) * 100)}%` }} /></div><p>The agent optimizes perceived customer value; DealGuard separately protects actual merchant costs.</p></article><article className="panel timeline-card"><div className="panel-heading"><div><p className="eyebrow">STATE MACHINE</p><h3>Bounded by design</h3></div></div><ol>{["Buyer intent", "Merchant analysis", "Structured offer", "DealGuard validation", "Signed deal"].map((step, index) => <li className={stream.length > index ? "done" : ""} key={step}><span>{stream.length > index ? <Check size={12} /> : index + 1}</span>{step}</li>)}</ol></article></aside></section>
+    <ConversationPanel chat={chat} chatBusy={chatBusy} sessionId={sessionId} />
     {deal && <AuthorizedDealCard deal={deal} offer={offer} onPayment={onPayment} paymentMessage={paymentMessage} />}</div>;
+}
+
+function ConversationPanel({ chat, chatBusy, sessionId }: { chat: ChatTurn[]; chatBusy: boolean; sessionId: string }) {
+  const tail = useRef<HTMLDivElement | null>(null);
+  useEffect(() => { tail.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [chat.length]);
+  return <article className="panel chat-panel">
+    <div className="panel-heading"><div><p className="eyebrow">LIVE CONVERSATION</p><h3>Buyer &harr; merchant agent</h3></div>{chatBusy ? <StatusPill tone="blue">Agent replying</StatusPill> : sessionId ? <StatusPill tone="green">Session open</StatusPill> : <StatusPill tone="slate">No session yet</StatusPill>}</div>
+    <div className="chat-scroll">
+      {chat.length === 0 && <div className="chat-empty"><MessageSquareText size={20} /><p>Write to your buyer agent on the left and press send. Each reply is a proposal DealGuard has already ruled on, so a price that moves here is a price the merchant has authorized.</p></div>}
+      {chat.map((turn, index) => <div className={`chat-turn ${turn.role} ${turn.tone ?? ""}`} key={`${turn.role}-${index}`}>
+        <div className="chat-avatar">{turn.role === "buyer" ? <User size={14} /> : <BrainCircuit size={14} />}</div>
+        <div className="chat-bubble">
+          <div className="chat-meta"><strong>{turn.role === "buyer" ? "You" : "Merchant agent"}</strong><span>{turn.at}</span></div>
+          <p>{turn.text}</p>
+          {(turn.price !== undefined || turn.code) && <div className="chat-tags">{turn.price !== undefined && <span className="chat-price"><Sparkles size={12} />{currency(turn.price)}</span>}{turn.code && <span className="code-badge"><ShieldX size={12} />{turn.code}</span>}</div>}
+        </div>
+      </div>)}
+      <div ref={tail} />
+    </div>
+    <p className="input-footnote"><LockKeyhole size={13} />Your words reach the proposal model as preference text only. Every number is re-derived by DealGuard before it is shown, so a message cannot talk the price below the merchant floor.</p>
+  </article>;
 }
 
 function OfferPreview({ offer, large = false }: { offer: Offer; large?: boolean }) { return <div className={`offer-preview ${large ? "large" : ""}`}><div><span>PROPOSED PACKAGE</span><strong>{currency(offer.offered_price)}</strong></div><div className="offer-benefits">{offer.concessions.map((item) => <span key={item}><Check size={12} />{item}</span>)}</div><p>{offer.justification}</p><div className="offer-footer"><span><Sparkles size={13} />{currency(offer.estimated_customer_value)} estimated value</span><span><Clock3 size={13} />{offer.delivery_days}-day delivery</span></div></div>; }

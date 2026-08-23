@@ -103,6 +103,11 @@ def _public_brief(policy: MerchantPolicy, intent: BuyerIntent, round_number: int
             "preferred_delivery_days": intent.preferred_delivery_days,
             "desired_concession_ids": intent.desired_freebies,
             "priorities": intent.priorities,
+            # The buyer's own words, so a chat turn gets an answer instead of a generic pitch.
+            # This is untrusted input: an injection attempt here can only change wording, because
+            # coerce_offer clamps the price into the band below and DealGuard re-derives every
+            # number afterwards. Nothing written here can authorize anything.
+            "message": intent.request_message,
         },
         "offer_rules": {
             "round": round_number,
@@ -117,7 +122,8 @@ def _public_brief(policy: MerchantPolicy, intent: BuyerIntent, round_number: int
             "instruction": (
                 "Vary the price and the concession mix from round to round. Choose a price "
                 "inside the min/max band. Write a fresh, specific justification each time; "
-                "never reuse a previous sentence."
+                "never reuse a previous sentence. Reply directly to buyer_preferences.message "
+                "in the justification, as the merchant agent speaking to the buyer."
             ),
         },
         "response_contract": {

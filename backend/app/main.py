@@ -107,13 +107,18 @@ async def start_negotiation(intent: BuyerIntent) -> StreamingResponse:
 
 
 @app.post("/api/negotiation/{session_id}/message")
-def add_message(session_id: str, body: BuyerMessage) -> dict[str, str]:
-    session = repository.get_session(session_id)
-    if not session:
-        raise error("SESSION_NOT_FOUND", "Negotiation session was not found.", 404)
-    repository.add_event(session_id, "BUYER_MESSAGE", "INFO", "Buyer sent a follow-up message.", payload={"length": len(body.message)})
-    # The message is audit-safe; it cannot alter policy, deals, or payment authority.
-    return {"status": "recorded", "message": "Buyer message recorded for the next bounded negotiation turn."}
+def add_message(session_id: str, body: BuyerMessage) -> dict[str, object]:
+    """One buyer chat message, answered by one guarded negotiation round.
+
+    The reply text and the price both come from a proposal DealGuard has already evaluated, so a
+    conversation can move the price without ever moving the authorization boundary. Synchronous on
+    purpose: FastAPI runs it in a worker thread, so the blocking provider call cannot stall the
+    event loop that is serving other negotiations.
+    """
+    try:
+        return coordinator.chat_turn(session_id, body.message)
+    except KeyError:
+        raise error("SESSION_NOT_FOUND", "Negotiation session was not found.", 404) from None
 
 
 @app.post("/api/offers/{offer_id}/validate")

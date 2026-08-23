@@ -236,6 +236,37 @@ class DealMeshRepository:
                 for row in records
             ]
 
+    def count_events(self, session_id: str, event_type: str) -> int:
+        """How many times one event has fired inside one session.
+
+        Used to number chat turns, so a conversation is bounded by its own audit trail rather
+        than by in-memory state that a restart would forget.
+        """
+        with self.sessions() as db:
+            return db.scalar(
+                select(func.count(EventRow.id))
+                .where(EventRow.session_id == session_id, EventRow.event_type == event_type)
+            ) or 0
+
+    def session_deal_ids(self, session_id: str) -> list[str]:
+        """Deal ids created inside one negotiation session, oldest first.
+
+        Read from the event log rather than a column: authorized_deals has no session key, and
+        every authorization already records its session and deal id here.
+        """
+        with self.sessions() as db:
+            rows = db.scalars(
+                select(EventRow)
+                .where(EventRow.session_id == session_id, EventRow.event_type.in_(("DEAL_AUTHORIZED", "HUMAN_REVIEW")))
+                .order_by(EventRow.id)
+            ).all()
+        found = [
+            str(row.payload["deal_id"])
+            for row in rows
+            if isinstance(row.payload, dict) and row.payload.get("deal_id")
+        ]
+        return list(dict.fromkeys(found))
+
     @staticmethod
     def _roll_over(row: RiskStateRow) -> RiskStateRow:
         """Reset the per-day counters when the UTC date has changed.
@@ -343,11 +374,16 @@ class DealMeshRepository:
             deal.status = "PAID"
 
     def add_daily_concession_cost(self, amount: int) -> None:
+        """Charge today's concession spend, or refund it with a negative amount.
+
+        Refunds exist because a superseded offer was never actually given away. The counter is
+        clamped at zero so a refund can never manufacture extra daily budget.
+        """
         with self.sessions.begin() as db:
             row = db.get(RiskStateRow, 1)
             assert row is not None
             self._roll_over(row)
-            row.daily_concession_cost += amount
+            row.daily_concession_cost = max(0, row.daily_concession_cost + amount)
 
     def agent_state(self) -> dict[str, Any]:
         """Authoritative agent/usage state so the UI never has to guess."""
