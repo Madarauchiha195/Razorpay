@@ -33,6 +33,11 @@ class Settings:
     # A relative SQLite URL keeps local startup portable on Windows, macOS, and Linux.
     # Set DATABASE_URL to PostgreSQL in a shared environment.
     database_url: str = os.getenv("DATABASE_URL", "sqlite:///./dealmesh.db")
+    cors_origins: tuple[str, ...] = tuple(
+        origin.strip()
+        for origin in os.getenv("CORS_ORIGINS", "").split(",")
+        if origin.strip()
+    )
     deal_signing_secret: str = os.getenv("DEAL_SIGNING_SECRET", "development-only-change-me")
     deal_expiry_minutes: int = int(os.getenv("DEAL_EXPIRY_MINUTES", "15"))
     llm_provider: str = _resolve_provider()

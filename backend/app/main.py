@@ -54,7 +54,7 @@ app.add_middleware(
         f"http://{host}:{port}"
         for host in ("localhost", "127.0.0.1")
         for port in (5173, 5174, 5175, 4173)
-    ],
+    ] + list(settings.cors_origins),
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT"],
     allow_headers=["Content-Type", "Idempotency-Key"],
