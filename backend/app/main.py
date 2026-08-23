@@ -2,13 +2,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field
 
 from .config import settings
@@ -348,3 +352,44 @@ async def razorpay_webhook(request: Request) -> dict[str, str]:
     if not razorpay.verify_webhook(payload, request.headers.get("X-Razorpay-Signature")):
         raise error("WEBHOOK_SIGNATURE_INVALID", "Webhook signature verification failed.", 401)
     return {"status": "accepted"}
+
+
+# --------------------------------------------------------------------- single-origin hosting
+#
+# When the built studio is present, this process serves the UI and the API on one port. That
+# makes the whole project one deployable unit, and it removes CORS from the picture entirely -
+# the browser is talking to the same origin it loaded the page from.
+#
+# The UI needs no code change to cooperate. App.tsx reads
+#     import.meta.env.VITE_API_URL ?? "http://127.0.0.1:8000"
+# and `??` only falls back on null/undefined, so building with an empty VITE_API_URL leaves
+# API_URL as "" and every request becomes a same-origin relative path like /api/products.
+#
+# If there is no build on disk the mount is skipped and the API runs alone, which is what the
+# two-port `vite dev` workflow wants.
+
+
+def _frontend_dist() -> Path | None:
+    """Locate a built frontend, checking an explicit override, the repo layout, then the image."""
+    candidates: list[Path] = []
+    override = os.getenv("FRONTEND_DIST", "").strip()
+    if override:
+        candidates.append(Path(override))
+    # backend/app/main.py -> parents[2] is the repository root.
+    candidates.append(Path(__file__).resolve().parents[2] / "frontend" / "dist")
+    candidates.append(Path("/app/static"))
+    for candidate in candidates:
+        if (candidate / "index.html").is_file():
+            return candidate
+    return None
+
+
+_DIST = _frontend_dist()
+if _DIST is not None:
+    # Mounted last, after every /api route above, so the catch-all cannot shadow the API.
+    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="studio")
+    logging.getLogger("dealmesh").info("Serving the built studio from %s on the API port", _DIST)
+else:
+    logging.getLogger("dealmesh").info(
+        "No frontend build found; serving the API only. Run `npm run build` in frontend/ to serve the UI here too."
+    )
