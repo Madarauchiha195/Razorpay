@@ -1,0 +1,26 @@
+services:
+  api:
+    build: ./backend
+    environment:
+      DATABASE_URL: sqlite:////data/dealmesh.db
+      DEAL_SIGNING_SECRET: ${DEAL_SIGNING_SECRET:-replace-this-before-any-public-deployment}
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - dealmesh-data:/data
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_URL: http://127.0.0.1:8000
+    ports:
+      - "4173:80"
+    depends_on:
+      - api
+
+volumes:
+  dealmesh-data:

@@ -1,0 +1,21 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "dealmesh-frontend",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": [
+        "run",
+        "dev",
+        "--",
+        "--host",
+        "localhost",
+        "--port",
+        "5173",
+        "--strictPort"
+      ],
+      "cwd": "frontend",
+      "port": 5173
+    }
+  ]
+}
