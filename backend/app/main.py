@@ -44,9 +44,12 @@ app = FastAPI(title="DealMesh API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     # 5173 is `vite dev`; 4173 is `vite preview`, which is what docker-compose serves.
+    # 5174-5175 are Vite's automatic fallbacks when 5173 is already taken. Without them a second
+    # dev server starts fine, answers nothing, and looks to the buyer studio like a dead backend.
     allow_origins=[
-        "http://localhost:5173", "http://127.0.0.1:5173",
-        "http://localhost:4173", "http://127.0.0.1:4173",
+        f"http://{host}:{port}"
+        for host in ("localhost", "127.0.0.1")
+        for port in (5173, 5174, 5175, 4173)
     ],
     allow_credentials=False,
     allow_methods=["GET", "POST", "PUT"],
